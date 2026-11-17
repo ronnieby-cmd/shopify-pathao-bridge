@@ -169,10 +169,11 @@ app.post('/webhooks/orders-create', async (req, res) => {
   // effort against Pathao.
   res.status(200).send('ok');
 
-  if (order.source_name !== 'web') {
+  const ALLOWED_SOURCES = ['web', 'shopify_draft_order'];
+  if (!ALLOWED_SOURCES.includes(order.source_name)) {
     console.log(`⏭️ Order ${order.id} ignored`);
     console.log(`Source: ${order.source_name}`);
-    console.log('Only source_name="web" is allowed');
+    console.log(`Only source_name in [${ALLOWED_SOURCES.join(', ')}] is allowed`);
     return;
   }
 
