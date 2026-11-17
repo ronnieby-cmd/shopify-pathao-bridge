@@ -13,6 +13,8 @@ const {
   SHOP,
   SHOPIFY_API_VERSION,
   SHOPIFY_WEBHOOK_SECRET,
+  SHOPIFY_CLIENT_ID,
+  SHOPIFY_CLIENT_SECRET,
   PATHAO_BASE_URL,
   PATHAO_CLIENT_ID,
   PATHAO_CLIENT_SECRET,
@@ -21,6 +23,9 @@ const {
   PATHAO_GRANT_TYPE = 'password',
   MERCHANT_STORE_ID,
 } = process.env;
+
+let shopifyToken = null;
+let shopifyTokenExpiresAt = 0;
 
 const app = express();
 
@@ -146,6 +151,126 @@ async function createPathaoOrder(payload, accessToken) {
   return { ok: res.ok, data };
 }
 
+// Shopify's custom-app "client_credentials" grant — same mechanism the
+// Pathao-to-Shopify fulfillment service already uses successfully.
+async function getShopifyAccessToken() {
+  if (shopifyToken && Date.now() < shopifyTokenExpiresAt) return shopifyToken;
+  const res = await fetch(`https://${SHOP}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+    }).toString(),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.access_token) {
+    throw Object.assign(new Error('Shopify token failed'), { response: data });
+  }
+  shopifyToken = data.access_token;
+  shopifyTokenExpiresAt = Date.now() + (data.expires_in || 86400) * 1000;
+  return shopifyToken;
+}
+
+async function shopifyGraphQL(query, variables = {}) {
+  const token = await getShopifyAccessToken();
+  const res = await fetch(`https://${SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'X-Shopify-Access-Token': token,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const payload = await res.json();
+  if (!res.ok) throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(payload)}`);
+  if (payload.errors?.length) throw new Error(payload.errors.map((e) => e.message).join(', '));
+  return payload.data;
+}
+
+function buildPathaoTrackingUrl(consignmentId, phone) {
+  return (
+    'https://merchant.pathao.com/tracking' +
+    `?consignment_id=${encodeURIComponent(consignmentId)}` +
+    `&phone=${encodeURIComponent(phone)}`
+  );
+}
+
+// Fulfills every open fulfillment order on the just-created Shopify order,
+// tagging it with the Pathao consignment as the tracking number. Runs right
+// after a successful Pathao order creation, using the order data already in
+// hand — no need to search Shopify for it like the reverse (Pathao-webhook)
+// service does.
+async function fulfillShopifyOrder(order, consignmentId, phone) {
+  const trackingUrl = buildPathaoTrackingUrl(consignmentId, phone);
+  const orderGid = `gid://shopify/Order/${order.id}`;
+
+  const { order: orderData } = await shopifyGraphQL(
+    `query GetOrderFulfillmentOrders($id: ID!) {
+      order(id: $id) {
+        fulfillmentOrders(first: 10) {
+          nodes {
+            id
+            status
+            fulfillmentHolds { id }
+          }
+        }
+      }
+    }`,
+    { id: orderGid }
+  );
+
+  const fulfillmentOrders = orderData?.fulfillmentOrders?.nodes || [];
+  let fulfilledCount = 0;
+
+  for (const fo of fulfillmentOrders) {
+    let status = String(fo.status || '').toUpperCase();
+
+    if (status === 'ON_HOLD' && fo.fulfillmentHolds?.length) {
+      const holdIds = fo.fulfillmentHolds.map((h) => h.id).filter(Boolean);
+      await shopifyGraphQL(
+        `mutation ReleaseHold($id: ID!, $holdIds: [ID!]) {
+          fulfillmentOrderReleaseHold(id: $id, holdIds: $holdIds) {
+            fulfillmentOrder { id status }
+            userErrors { field message }
+          }
+        }`,
+        { id: fo.id, holdIds }
+      );
+      status = 'OPEN';
+    }
+
+    if (status === 'CLOSED' || status === 'CANCELLED') continue;
+
+    const result = await shopifyGraphQL(
+      `mutation CreateFulfillment($fulfillment: FulfillmentInput!) {
+        fulfillmentCreate(fulfillment: $fulfillment) {
+          fulfillment { id status }
+          userErrors { field message }
+        }
+      }`,
+      {
+        fulfillment: {
+          lineItemsByFulfillmentOrder: [{ fulfillmentOrderId: fo.id }],
+          notifyCustomer: false,
+          trackingInfo: {
+            company: 'Pathao',
+            number: String(consignmentId),
+            url: trackingUrl,
+          },
+        },
+      }
+    );
+
+    const errors = result?.fulfillmentCreate?.userErrors;
+    if (errors?.length) throw new Error(errors.map((e) => e.message).join(', '));
+    fulfilledCount += 1;
+  }
+
+  return fulfilledCount;
+}
+
 app.post('/webhooks/orders-create', async (req, res) => {
   if (!verifyShopifyWebhook(req)) {
     console.log('❌ Shopify webhook signature verification failed');
@@ -232,6 +357,18 @@ app.post('/webhooks/orders-create', async (req, res) => {
           2
         )
       );
+
+      try {
+        const fulfilledCount = await fulfillShopifyOrder(
+          order,
+          data.data.consignment_id,
+          payload.recipient_phone
+        );
+        console.log(`✅ SHOPIFY ORDER FULFILLED (${fulfilledCount} fulfillment order(s))`);
+      } catch (fulfillErr) {
+        console.log('❌ SHOPIFY FULFILLMENT FAILED');
+        console.log(JSON.stringify(fulfillErr.response || { message: fulfillErr.message }, null, 2));
+      }
     } else {
       console.log('❌ PATHAO ORDER CREATION FAILED');
       console.log(JSON.stringify(data, null, 2));
