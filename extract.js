@@ -197,31 +197,60 @@ function buildPathaoTrackingUrl(consignmentId, phone) {
   );
 }
 
-// Fulfills every open fulfillment order on the just-created Shopify order,
-// tagging it with the Pathao consignment as the tracking number. Runs right
-// after a successful Pathao order creation, using the order data already in
-// hand — no need to search Shopify for it like the reverse (Pathao-webhook)
-// service does.
-async function fulfillShopifyOrder(order, consignmentId, phone) {
-  const trackingUrl = buildPathaoTrackingUrl(consignmentId, phone);
-  const orderGid = `gid://shopify/Order/${order.id}`;
+function normalizeOrderName(value) {
+  return String(value || '').trim().toUpperCase();
+}
 
-  const { order: orderData } = await shopifyGraphQL(
-    `query GetOrderFulfillmentOrders($id: ID!) {
-      order(id: $id) {
-        fulfillmentOrders(first: 10) {
+// The app's live grant doesn't actually satisfy the read_orders/read_all_orders
+// scope that Order.fulfillmentOrders needs (despite it being declared), so —
+// same workaround the reverse (Pathao-webhook) service uses — find the
+// fulfillment orders via the top-level `fulfillmentOrders` connection, which
+// only needs the narrower fulfillment-order scopes we do have. The order was
+// just created, so it's at or near the front of newest-first results.
+async function findFulfillmentOrdersByName(merchantOrderId, maxChecked = 250) {
+  const expected = normalizeOrderName(merchantOrderId);
+  let cursor = null;
+  let checked = 0;
+
+  while (checked < maxChecked) {
+    const data = await shopifyGraphQL(
+      `query FindFulfillmentOrders($first: Int!, $after: String) {
+        fulfillmentOrders(first: $first, after: $after, reverse: true) {
           nodes {
             id
+            orderName
             status
             fulfillmentHolds { id }
           }
+          pageInfo { hasNextPage endCursor }
         }
-      }
-    }`,
-    { id: orderGid }
-  );
+      }`,
+      { first: 50, after: cursor }
+    );
 
-  const fulfillmentOrders = orderData?.fulfillmentOrders?.nodes || [];
+    const connection = data?.fulfillmentOrders;
+    const nodes = connection?.nodes || [];
+    checked += nodes.length;
+
+    const matches = nodes.filter((fo) => normalizeOrderName(fo.orderName) === expected);
+    if (matches.length > 0) return matches;
+
+    if (!connection?.pageInfo?.hasNextPage) break;
+    cursor = connection.pageInfo.endCursor;
+    if (!cursor) break;
+  }
+
+  return [];
+}
+
+// Fulfills every open fulfillment order on the just-created Shopify order,
+// tagging it with the Pathao consignment as the tracking number. Runs right
+// after a successful Pathao order creation, using the order data already in
+// hand.
+async function fulfillShopifyOrder(order, consignmentId, phone) {
+  const trackingUrl = buildPathaoTrackingUrl(consignmentId, phone);
+
+  const fulfillmentOrders = await findFulfillmentOrdersByName(order.name);
   let fulfilledCount = 0;
 
   for (const fo of fulfillmentOrders) {
